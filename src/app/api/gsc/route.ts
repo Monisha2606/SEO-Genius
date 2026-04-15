@@ -1,0 +1,173 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { getServerSession } from 'next-auth'
+import { authOptions } from '../auth/[...nextauth]/route'
+import {
+  fetchSearchAnalytics,
+  fetchSiteList,
+  fetchSitemaps,
+  getDateRange,
+  calculateCTR,
+} from '@/lib/gsc'
+import { analyzeGSCData, GSCData } from '@/lib/ai'
+import connectDB from '@/lib/mongodb'
+import { Report } from '@/models'
+
+export async function POST(req: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions)
+    if (!session?.accessToken) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await req.json()
+    const { siteUrl, days = 28 } = body
+
+    if (!siteUrl) {
+      return NextResponse.json({ error: 'siteUrl is required' }, { status: 400 })
+    }
+
+    const { startDate, endDate } = getDateRange(days)
+    const { startDate: prevStart, endDate: prevEnd } = getDateRange(days * 2)
+
+    // Fetch all GSC data in parallel
+    const [queryRows, pageRows, deviceRows, countryRows, prevQueryRows, sitemaps] =
+      await Promise.allSettled([
+        fetchSearchAnalytics(session.accessToken, siteUrl, startDate, endDate, ['query'], 500),
+        fetchSearchAnalytics(session.accessToken, siteUrl, startDate, endDate, ['page'], 500),
+        fetchSearchAnalytics(session.accessToken, siteUrl, startDate, endDate, ['device']),
+        fetchSearchAnalytics(session.accessToken, siteUrl, startDate, endDate, ['country'], 50),
+        fetchSearchAnalytics(session.accessToken, siteUrl, prevStart, prevEnd, ['query'], 500),
+        fetchSitemaps(session.accessToken, siteUrl),
+      ])
+
+    const queries = queryRows.status === 'fulfilled' ? queryRows.value : []
+    const pages = pageRows.status === 'fulfilled' ? pageRows.value : []
+    const devices = deviceRows.status === 'fulfilled' ? deviceRows.value : []
+    const countries = countryRows.status === 'fulfilled' ? countryRows.value : []
+    const prevQueries = prevQueryRows.status === 'fulfilled' ? prevQueryRows.value : []
+
+    // Calculate overview
+    const totalClicks = queries.reduce((s, r) => s + (r.clicks || 0), 0)
+    const totalImpressions = queries.reduce((s, r) => s + (r.impressions || 0), 0)
+    const avgCTR = calculateCTR(totalClicks, totalImpressions)
+    const avgPosition =
+      queries.length > 0
+        ? queries.reduce((s, r) => s + (r.position || 0), 0) / queries.length
+        : 0
+
+    const prevClicks = prevQueries.reduce((s, r) => s + (r.clicks || 0), 0)
+    const prevImpressions = prevQueries.reduce((s, r) => s + (r.impressions || 0), 0)
+    const prevAvgCTR = calculateCTR(prevClicks, prevImpressions)
+    const prevAvgPosition =
+      prevQueries.length > 0
+        ? prevQueries.reduce((s, r) => s + (r.position || 0), 0) / prevQueries.length
+        : 0
+
+    const gscData: GSCData = {
+      siteUrl,
+      dateRange: { start: startDate, end: endDate },
+      overview: {
+        totalClicks,
+        totalImpressions,
+        avgCTR,
+        avgPosition,
+        previousPeriod: {
+          totalClicks: prevClicks,
+          totalImpressions: prevImpressions,
+          avgCTR: prevAvgCTR,
+          avgPosition: prevAvgPosition,
+        },
+      },
+      topQueries: queries
+        .map((r) => ({
+          query: r.keys?.[0] || '',
+          clicks: r.clicks || 0,
+          impressions: r.impressions || 0,
+          ctr: calculateCTR(r.clicks || 0, r.impressions || 0),
+          position: r.position || 0,
+        }))
+        .sort((a, b) => b.clicks - a.clicks)
+        .slice(0, 100),
+      topPages: pages
+        .map((r) => ({
+          page: r.keys?.[0] || '',
+          clicks: r.clicks || 0,
+          impressions: r.impressions || 0,
+          ctr: calculateCTR(r.clicks || 0, r.impressions || 0),
+          position: r.position || 0,
+        }))
+        .sort((a, b) => b.clicks - a.clicks)
+        .slice(0, 50),
+      devices: devices.map((r) => ({
+        device: r.keys?.[0] || '',
+        clicks: r.clicks || 0,
+        impressions: r.impressions || 0,
+        ctr: calculateCTR(r.clicks || 0, r.impressions || 0),
+        position: r.position || 0,
+      })),
+      countries: countries
+        .map((r) => ({
+          country: r.keys?.[0] || '',
+          clicks: r.clicks || 0,
+          impressions: r.impressions || 0,
+          ctr: calculateCTR(r.clicks || 0, r.impressions || 0),
+          position: r.position || 0,
+        }))
+        .sort((a, b) => b.clicks - a.clicks),
+    }
+
+    // Run AI analysis
+    const analysis = await analyzeGSCData(gscData)
+
+    // Save to MongoDB
+    await connectDB()
+    const ReportModel = Report()
+    const report = await ReportModel.create({
+      userId: session.user.id,
+      siteUrl,
+      dateRange: { start: startDate, end: endDate },
+      gscData,
+      analysis,
+    })
+
+    return NextResponse.json({
+      reportId: report._id.toString(),
+      gscData,
+      analysis,
+    })
+  } catch (error: unknown) {
+    console.error('GSC fetch error:', error)
+    const message = error instanceof Error ? error.message : 'Failed to fetch GSC data'
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions)
+    if (!session?.accessToken) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const url = new URL(req.url)
+    const listSites = url.searchParams.get('listSites')
+
+    if (listSites) {
+      const sites = await fetchSiteList(session.accessToken)
+      return NextResponse.json({ sites })
+    }
+
+    // Return recent reports
+    await connectDB()
+    const ReportModel = Report()
+    const reports = await ReportModel.find({ userId: session.user.id })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .select('siteUrl dateRange analysis.healthScore createdAt')
+
+    return NextResponse.json({ reports })
+  } catch (error: unknown) {
+    console.error('GSC GET error:', error)
+    return NextResponse.json({ error: 'Failed to fetch data' }, { status: 500 })
+  }
+}
